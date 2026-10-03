@@ -1,9 +1,13 @@
 """
 pello_schema.py - zakładka „Schemat instalacji”: rysunek hydrauliczny z odczytami na żywo.
-Pello 3.5 Monitor (wersja FREE) - autor: Mariusz <mk.helius@gmail.com>
+Pello Monitor (wersja FREE) - autor: Mariusz <mk.helius@gmail.com>
 
 Schemat: komin i kocioł -> (pompa kotła na powrocie) -> rozdzielacz -> 3 obwody:
-    1. woda użytkowa (bojler CWU),  2. grzejniki,  3. ogrzewanie podłogowe z zaworem 3-drożnym.
+    1. woda użytkowa (bojler CWU),
+    2. grzejniki            = obwód CO 2 sterownika Pello D (pompa out_pomp2, termostat pokojowy RF),
+    3. ogrzewanie podłogowe = obwód CO 1 sterownika (pompa out_pomp1, zawór 4D, czujnik T1).
+"Pompa kotła" nie ma osobnego wyjścia w sterowniku - pokazujemy ją jako włączoną, gdy pracuje
+którakolwiek pompa (CO 1, CO 2 lub CWU).
 Rysunek skaluje się do wielkości okna. Kolor rur pokazuje, czy obwód pracuje
 (czerwone = zasilanie, niebieskie = powrót, szare = pompa wyłączona).
 
@@ -12,8 +16,8 @@ Chcesz zmienić, jakie odczyty pokazują się przy danym elemencie? Edytuj słow
 """
 import tkinter as tk
 
-from pello_config import (BORDER, CARD, FG, FONT_FAMILY, GREEN, GROUPS, LABEL_FG, MUTED, ACCENT,
-                          RED, format_value, tofloat, value_color)
+from pello_config import (ACCENT, BORDER, CARD, FG, FONT_FAMILY, GREEN, LABEL_FG, MUTED, RED,
+                          format_value, tofloat, value_color, with_unit)
 
 # ---------------------------------------------------------------- odczyty przy elementach
 # "element": (tytuł karty, [(klucz parametru, opis), ...])
@@ -21,7 +25,8 @@ READINGS = {
     "komin": ("Komin", [
         ("tsp_value", "Temp. spalin"),
         ("out_dm", "Dmuchawa"),
-        ("act_dm_speed", "Obroty dmuchawy"),
+        ("act_dm_speed", "Prędkość dmuchawy"),
+        ("mpl_dm_rpm", "Obroty dmuchawy"),
     ]),
     "kociol": ("Kocioł", [
         ("tkot_value", "Temp. kotła"),
@@ -33,29 +38,34 @@ READINGS = {
     ]),
     "zewn": ("Czujnik zewnętrzny", [
         ("tzew_value", "Temp. zewnętrzna"),
+        ("zima_lato", "Tryb pracy"),
     ]),
     "rozdz": ("Rozdzielacz", [
         ("tpow_value", "Powrót do kotła"),
-        ("out_pomp1", "Pompa kotła"),
+        ("_pompa_kotla", "Pompa kotła"),
     ]),
     "cwu": ("Woda użytkowa (CWU)", [
+        ("tcwu_value", "Temp. CWU"),
         ("cwu_tzad", "Zadana CWU"),
         ("out_cwu", "Pompa CWU"),
     ]),
-    "grz": ("Grzejniki", [
-        ("tcwu_value", "Temp. CO 2"),
-        ("out_pomp1", "Pompa kotła"),
-        ("zima_lato", "Tryb pracy"),
+    "grz": ("Grzejniki (CO 2)", [
+        ("t2_value", "Temp. CO 2"),
+        ("ob2_pok_tact", "Temp. pokoju"),
+        ("ob2_pok_tzad", "Zadana pokoju"),
+        ("out_pomp2", "Pompa CO 2"),
     ]),
-    "podl": ("Ogrzewanie podłogowe", [
-        ("twew_value", "Temp. CO 1"),
+    "podl": ("Podłogówka (CO 1)", [
+        ("t1_value", "Temp. obiegu"),
+        ("ob1_pok_tact", "Temp. pokoju"),
         ("out_zaw4d", "Zawór"),
+        ("out_pomp1", "Pompa CO 1"),
     ]),
 }
 
 # pozycja karty na rysunku: (x, y, szerokość) we współrzędnych logicznych 1100 x 700
 CARD_POS = {
-    "komin": (105, 30, 215),
+    "komin": (105, 30, 275),
     "kociol": (20, 424, 250),
     "zewn": (20, 610, 250),
     "rozdz": (290, 418, 200),
@@ -72,7 +82,6 @@ PIPE_BLUE = "#2563eb"
 PIPE_OFF = "#b6bcc6"
 STEEL = "#4b5563"
 
-UNITS = {k: u for g in GROUPS.values() for k, _, u in g}
 
 
 class SchemaView:
@@ -88,6 +97,10 @@ class SchemaView:
 
     # ------------------------------------------------------------- API
     def update(self, data, fuel_thr=20):
+        if data is not None:
+            data = dict(data)
+            running = any(str(data.get(k)) == "1" for k in ("out_pomp1", "out_pomp2", "out_cwu"))
+            data["_pompa_kotla"] = "1" if running else "0"
         self.data = data
         self.offline = False
         self.fuel_thr = fuel_thr
@@ -108,9 +121,7 @@ class SchemaView:
         raw = self._raw(key)
         if raw is None:
             return "—"
-        txt = format_value(key, raw)
-        unit = UNITS.get(key, "")
-        return f"{txt} {unit}" if unit and txt != "—" else txt
+        return with_unit(key, format_value(key, raw))
 
     def _temp(self, key):
         raw = self._raw(key)
@@ -180,16 +191,17 @@ class SchemaView:
         self.ox = (w - W * self.s) / 2
         self.oy = (h - H * self.s) / 2
 
-        pco, pcwu = self._on("out_pomp1"), self._on("out_cwu")
+        pco1, pco2, pcwu = self._on("out_pomp1"), self._on("out_pomp2"), self._on("out_cwu")
+        main_on = pco1 or pco2 or pcwu
         valve = str(self._raw("out_zaw4d"))
 
         self._draw_title()
-        self._draw_elements(pcwu, pco)
-        self._draw_pipes(pco, pcwu)
+        self._draw_elements(pcwu, pco2, pco1)
+        self._draw_pipes(pco1, pco2, pcwu)
         self._draw_chimney()
         self._draw_boiler()
         self._draw_valve(valve)
-        self._pump(335, 365, pco, "Pompa kotła", PIPE_BLUE, -1)   # na powrocie (niebieska rura)
+        self._pump(335, 365, main_on, "Pompa kotła", PIPE_BLUE, -1)   # na powrocie (niebieska rura)
         self._pump(625, 115, pcwu, "Pompa CWU", PIPE_RED, 1)
         self._draw_labels()
         for key in READINGS:
@@ -203,27 +215,28 @@ class SchemaView:
         self._text(560, 22, "Schemat instalacji", 20, True, FG)
         self._text(560, 46, "odczyty na żywo ze sterownika", 13, False, MUTED)
 
-    def _draw_elements(self, pcwu, pco):
+    def _draw_elements(self, pcwu, pco2, pco1):
         # rozdzielacz
         self._rrect(500, 90, 550, 630, 14, fill="#374151", outline="#111827", width=2)
         self._text(525, 360, "ROZDZIELACZ", 16, True, "#e5e7eb", "center", angle=90)
 
         # bojler CWU
         self._rrect(700, 70, 790, 230, 16, fill="#dbeafe", outline="#93c5fd", width=2)
+        self._text(745, 90, self._temp("tcwu_value"), 19, True, FG, "center")
         self._text(745, 216, "BOJLER", 12, True, MUTED, "center")
 
         # grzejnik
-        self._rrect(720, 308, 840, 422, 10, fill="#fee2e2" if pco else "#f3f4f6",
+        self._rrect(720, 308, 840, 422, 10, fill="#fee2e2" if pco2 else "#f3f4f6",
                     outline="#9ca3af", width=2)
         for i in range(7):
             x = 736 + i * 16
-            self._line([(x, 320), (x, 410)], "#d1d5db" if not pco else "#f87171", 6)
+            self._line([(x, 320), (x, 410)], "#d1d5db" if not pco2 else "#f87171", 6)
 
         # podłogówka
         self._rrect(690, 505, 845, 620, 12, fill="#fff7ed", outline="#fed7aa", width=2)
 
-    def _draw_pipes(self, pco, pcwu):
-        main_on = pco or pcwu
+    def _draw_pipes(self, pco1, pco2, pcwu):
+        main_on = pco1 or pco2 or pcwu
         red = lambda on: PIPE_RED if on else PIPE_OFF
         blue = lambda on: PIPE_BLUE if on else PIPE_OFF
 
@@ -240,17 +253,17 @@ class SchemaView:
         self._line([(846, 205), (790, 205)], PIPE_BLUE, 5, arrow=True)    # zimna woda
 
         # 2. grzejniki
-        self._line([(550, 330), (720, 330)], red(pco), 6, arrow=True)
-        self._line([(720, 400), (550, 400)], blue(pco), 6, arrow=True)
+        self._line([(550, 330), (720, 330)], red(pco2), 6, arrow=True)
+        self._line([(720, 400), (550, 400)], blue(pco2), 6, arrow=True)
 
         # 3. ogrzewanie podłogowe (zawór 3-drożny w punkcie 620,520)
-        self._line([(550, 520), (602, 520)], red(pco), 6, arrow=True)
-        self._line([(638, 520), (700, 520)], red(pco), 6, arrow=True)
-        self._line([(700, 605), (550, 605)], blue(pco), 6, arrow=True)
-        self._line([(620, 605), (620, 556)], blue(pco), 3, arrow=True, dash=(6, 4))   # mieszanie z powrotu
+        self._line([(550, 520), (602, 520)], red(pco1), 6, arrow=True)
+        self._line([(638, 520), (700, 520)], red(pco1), 6, arrow=True)
+        self._line([(700, 605), (550, 605)], blue(pco1), 6, arrow=True)
+        self._line([(620, 605), (620, 556)], blue(pco1), 3, arrow=True, dash=(6, 4))   # mieszanie z powrotu
         floor = [(700, 520), (830, 520), (830, 538), (710, 538), (710, 556), (830, 556), (830, 574),
                  (710, 574), (710, 590), (830, 590), (830, 605), (700, 605)]
-        self._line(floor, "#f97316" if pco else PIPE_OFF, 4)
+        self._line(floor, "#f97316" if pco1 else PIPE_OFF, 4)
 
     def _draw_valve(self, valve):
         col = {"0": "#9ca3af", "1": GREEN, "2": "#f59e0b"}.get(valve, "#d1d5db")

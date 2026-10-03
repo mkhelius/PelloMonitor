@@ -1,6 +1,6 @@
 """
 pello_tray.py - ikona płomienia (okno, plik .exe, zasobnik) oraz powiadomienia Windows.
-Pello 3.5 Monitor (wersja FREE) - autor: Mariusz <mk.helius@gmail.com>
+Pello Monitor (wersja FREE) - autor: Mariusz <mk.helius@gmail.com>
 
 Uruchomienie  `python pello_tray.py pello.ico`  zapisuje ikonę pliku .exe.
 """

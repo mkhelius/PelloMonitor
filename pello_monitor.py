@@ -1,13 +1,14 @@
 """
-Pello 3.5 Monitor - wersja FREE
+Pello Monitor - wersja FREE
 Autor: Mariusz <mk.helius@gmail.com>
 
-Odczyt i sterowanie sterownikiem Pello 3.5 (esterownik.pl).
+Odczyt i sterowanie sterownikiem Pello 3.5 / Pello D (esterownik.pl).
 
 Pliki programu:
   pello_monitor.py  - okno programu (ten plik, uruchamiać właśnie ten)
   pello_config.py   - stałe, kolory, teksty, funkcje pomocnicze
-  pello_client.py   - komunikacja ze sterownikiem i historia CSV (parser modułów BT4/termostaty)
+  pello_params.py   - katalog wszystkich parametrów sterownika (opisy, jednostki, formatowanie)
+  pello_client.py   - komunikacja ze sterownikiem i historia CSV
   pello_tray.py     - ikona płomienia, zasobnik systemowy, powiadomienia
   pello_schema.py   - zakładka „Schemat instalacji” (rysunek hydrauliczny z odczytami)
 
@@ -18,6 +19,7 @@ import datetime
 import json
 import math
 import os
+import queue
 import sys
 import threading
 import tkinter as tk
@@ -25,12 +27,19 @@ import tkinter.font as tkfont
 import urllib.parse
 import webbrowser
 from collections import deque
-from tkinter import ttk, messagebox
+from tkinter import ttk
 
 from pello_config import *          # stałe, kolory, GROUPS, helpery
-from pello_client import PelloClient, load_history, write_csv
+from pello_client import PelloClient, PelloWriteError, export_snapshot, load_history, write_csv
+import pello_secret
+from pello_params import GROUP_ORDER, set_override
 from pello_tray import TRAY_OK, Tray, icon_png_base64
 from pello_schema import SchemaView
+from pello_backup_view import BackupView
+import pello_dialogs
+import pello_edit as E
+from pello_dialogs import TreeTip, messagebox, simpledialog
+from pello_edit_view import ParamEditor
 
 
 class ScrollFrame(tk.Frame):
@@ -61,10 +70,14 @@ class ScrollFrame(tk.Frame):
 
 
 # ---------------------------------------------------------------- aplikacja
+ALARM_TAB_TEXT = "Alarmy"
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.sc = max(1.0, self.winfo_fpixels("1i") / 96.0)   # skala DPI
+        pello_dialogs.init(self, self.px)                      # jednolite okienka programu
         self.title(f"{APP_TITLE} – wersja {APP_EDITION}")
         self._set_window_icon()
         w = min(self.px(1040), self.winfo_screenwidth() - 40)
@@ -77,8 +90,11 @@ class App(tk.Tk):
         self.running = False
         self.gen = 0
         self.after_id = None
-        self.units = {k: u for g in GROUPS.values() for k, _, u in g}
         self.value_labels = {}
+        self.name_labels = {}
+        self.param_data = {}
+        self._orig_checked = False        # czy w tym połączeniu sprawdzono kopię pierwotną
+        self._p_shown, self._p_keys, self._p_vals = [], [], {}
 
         self.history = deque(maxlen=20000)   # (datetime, {klucz: float})
         self.prev_alarms = {}
@@ -88,8 +104,10 @@ class App(tk.Tk):
         self.offline_notified = False
         self.csv_error = ""
         self.hint_shown = False
-        self.tray = Tray(APP_TITLE, lambda: self.after(0, self.show_window),
-                         lambda: self.after(0, self.quit_app))
+        self._closing = False
+        self._q = queue.Queue()           # zadania z wątków roboczych / zasobnika -> wątek okna
+        self.tray = Tray(APP_TITLE, lambda: self._post(self.show_window),
+                         lambda: self._post(self.quit_app))
 
         self._setup_style()
         self.f_legend = tkfont.Font(family=FONT_FAMILY, size=10, weight="bold")
@@ -99,6 +117,7 @@ class App(tk.Tk):
         self._start_tray()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(200, self.draw_chart)
+        self.after(100, self._pump)
 
         if not self.host_var.get().strip():
             self.nb.select(self.tab_set)          # pierwsze uruchomienie -> Ustawienia
@@ -106,6 +125,27 @@ class App(tk.Tk):
             self.after(100, self.withdraw)
         if self.auto_var.get() and self.host_var.get().strip():
             self.after(500, self.toggle)
+
+    # ------------------------------------------------------------- komunikacja między wątkami
+    def _post(self, fn, *args):
+        """Bezpieczne z KAŻDEGO wątku: kolejkuje wywołanie, które wykona wątek okna (tkinter
+        nie jest bezpieczny wątkowo, więc wątki robocze nie wołają self.after)."""
+        self._q.put((fn, args))
+
+    def _pump(self):
+        """Wykonuje (w wątku okna) zadania zakolejkowane przez _post."""
+        if self._closing:
+            return
+        try:
+            while True:
+                fn, args = self._q.get_nowait()
+                try:
+                    fn(*args)
+                except Exception as e:                  # błąd jednego zadania nie zatrzymuje pompy
+                    print("Błąd zadania w tle:", e, file=sys.stderr)
+        except queue.Empty:
+            pass
+        self.after(100, self._pump)
 
     def _set_window_icon(self):
         try:
@@ -138,7 +178,7 @@ class App(tk.Tk):
         st.map("Card.TCheckbutton", background=[("active", CARD)])
 
         st.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(0, 4, 0, 0))
-        st.configure("TNotebook.Tab", padding=(24, 10), font=(FONT_FAMILY, 11, "bold"),
+        st.configure("TNotebook.Tab", padding=(18, 10), font=(FONT_FAMILY, 11, "bold"),
                      background="#dde2e8", foreground=MUTED, borderwidth=0)
         st.map("TNotebook.Tab", background=[("selected", BG)], foreground=[("selected", ACCENT_DK)])
 
@@ -155,6 +195,11 @@ class App(tk.Tk):
         for wdg in ("TEntry", "TSpinbox", "TCombobox"):
             st.configure(wdg, fieldbackground="white", bordercolor=BORDER, lightcolor=BORDER,
                          darkcolor=BORDER, padding=5)
+        st.configure("Params.Treeview", background="white", fieldbackground="white", foreground=FG,
+                     rowheight=self.px(26), font=(FONT_FAMILY, 10), borderwidth=0)
+        st.configure("Params.Treeview.Heading", background="#e5e7eb", foreground=LABEL_FG,
+                     font=(FONT_FAMILY, 10, "bold"), relief="flat", padding=(6, 6))
+        st.map("Params.Treeview", background=[("selected", "#fed7aa")], foreground=[("selected", FG)])
         st.configure("Vertical.TScrollbar", troughcolor=BG, background="#c7ccd4", bordercolor=BG,
                      arrowcolor=MUTED, relief="flat")
 
@@ -183,6 +228,7 @@ class App(tk.Tk):
         self.pass_var = tk.StringVar()
         self.int_var = tk.IntVar(value=30)
         self.save_pass = tk.BooleanVar(value=False)
+        self.pw_note = tk.StringVar(value="")
         self.cwu_var = tk.IntVar(value=45)
         self.kot_var = tk.IntVar(value=60)
         self.mode_var = tk.StringVar(value="Zima")
@@ -191,10 +237,12 @@ class App(tk.Tk):
         self.fuel_thr_var = tk.IntVar(value=20)
         self.tray_close_var = tk.BooleanVar(value=True)
         self.auto_var = tk.BooleanVar(value=False)
+        self.edit_var = tk.BooleanVar(value=False)      # edycja parametrów: zawsze zablokowana po starcie
+        self.edit_state = tk.StringVar(value="")
         self.range_var = tk.StringVar(value="6 godzin")
         self.status = tk.StringVar(value="Rozłączony")
         self.conn_var = tk.StringVar(value="Rozłączony")
-        self.dev_var = tk.StringVar(value="")
+        self.dev_var = tk.StringVar(value="sterownik Pello")
 
         # ---------- pasek nagłówka
         hdr = tk.Frame(self, bg=DARK)
@@ -206,15 +254,12 @@ class App(tk.Tk):
         k = s34 / 34.0
         flame = [(17, 5), (25, 17), (24, 26), (17, 31), (10, 26), (9, 17), (14, 14)]
         logo.create_polygon([c * k for p in flame for c in p], fill="#fff7ed", outline="")
-        tk.Label(hdr, text="Pello 3.5", font=(FONT_FAMILY, 17, "bold"), bg=DARK, fg="white"
+        tk.Label(hdr, text="Pello Monitor", font=(FONT_FAMILY, 17, "bold"), bg=DARK, fg="white"
                  ).pack(side="left")
-        tk.Label(hdr, text="monitor pieca", font=(FONT_FAMILY, 10), bg=DARK, fg="#9ca3af"
+        tk.Label(hdr, textvariable=self.dev_var, font=(FONT_FAMILY, 10), bg=DARK, fg="#9ca3af"
                  ).pack(side="left", padx=(10, 0), pady=(6, 0))
         tk.Label(hdr, text=APP_EDITION, font=(FONT_FAMILY, 9, "bold"), bg=ACCENT, fg="white",
                  padx=9, pady=1).pack(side="left", padx=(12, 0), pady=(6, 0))
-        # info o sterowniku (device_name | IP | wersja softu) - po połaczeniu
-        tk.Label(hdr, textvariable=self.dev_var, font=(FONT_FAMILY, 10), bg=DARK, fg="#9ca3af"
-                 ).pack(side="left", padx=(16, 0), pady=(6, 0))
 
         self.btn = ttk.Button(hdr, text="Połącz", style="Accent.TButton", command=self.toggle)
         self.btn.pack(side="right", padx=18)
@@ -239,14 +284,20 @@ class App(tk.Tk):
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=14, pady=(8, 6))
         tab_read = ScrollFrame(self.nb, BG)
+        self.tab_alarms = ScrollFrame(self.nb, BG)
         tab_ctl = tk.Frame(self.nb, bg=BG)
         tab_chart = tk.Frame(self.nb, bg=BG)
+        self.tab_params = tk.Frame(self.nb, bg=BG)
+        tab_backup = tk.Frame(self.nb, bg=BG)
         self.tab_set = ScrollFrame(self.nb, BG)
         tab_schema = tk.Frame(self.nb, bg=BG)
         self.nb.add(tab_read, text="Odczyty")
+        self.nb.add(self.tab_alarms, text=ALARM_TAB_TEXT)
         self.nb.add(tab_schema, text="Schemat instalacji")
         self.nb.add(tab_ctl, text="Sterowanie")
         self.nb.add(tab_chart, text="Wykres")
+        self.nb.add(self.tab_params, text="Parametry")
+        self.nb.add(tab_backup, text="Kopie")
         self.nb.add(self.tab_set, text="Ustawienia")
         tab_info = ScrollFrame(self.nb, BG)
         self.nb.add(tab_info, text="Info")
@@ -254,35 +305,282 @@ class App(tk.Tk):
 
         self.schema = SchemaView(tab_schema)
         self._build_readings(tab_read.inner)
+        self._build_alarms(self.tab_alarms.inner)
         self._build_controls(tab_ctl)
         self._build_chart(tab_chart)
+        self._build_params(self.tab_params)
+        self.backups = BackupView(
+            tab_backup, self._card, self.px,
+            get_data=lambda: self.param_data if self.running else None,     # „stan bieżący” tylko przy połączeniu
+            get_host=lambda: self.host_var.get(), program=f"{APP_TITLE} {APP_VERSION}",
+            set_status=self.status.set, notify=self.notify)
         self._build_settings(self.tab_set.inner)
         self._build_info(tab_info.inner)
 
     def _build_readings(self, parent):
+        self._build_group_cards(parent, READING_GROUPS, row=0)
+
+    def _build_alarms(self, parent):
+        """Zakładka „Alarmy”: podsumowanie aktywnych alarmów + wszystkie flagi alarmowe."""
+        parent.grid_columnconfigure(0, weight=1, uniform="col")
+        parent.grid_columnconfigure(1, weight=1, uniform="col")
+        card, body = self._card(parent, "Stan alarmów")
+        card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(10, 14))
+        self.alarm_summary = tk.Label(body, text="Brak połączenia ze sterownikiem", font=FONT_VALUE,
+                                      bg=CARD, fg=MUTED, anchor="w", justify="left",
+                                      wraplength=self.px(900))
+        self.alarm_summary.pack(fill="x", pady=8)
+        self._build_group_cards(parent, ALARM_GROUPS, row=1)
+
+    def _update_alarm_summary(self, data):
+        """Odświeża podsumowanie na zakładce „Alarmy” i napis na jej karcie (None = brak połączenia)."""
+        if data is None:
+            self.alarm_summary.config(text="Brak połączenia ze sterownikiem", fg=MUTED)
+            self.nb.tab(self.tab_alarms, text=ALARM_TAB_TEXT)
+            return
+        active = [k for k in ALARM_KEYS if str(data.get(k, "0")) == "1"]
+        if active:
+            self.alarm_summary.config(
+                text=f"⚠ Aktywne alarmy ({len(active)}):  " + ";  ".join(describe(k) for k in active), fg=RED)
+            self.nb.tab(self.tab_alarms, text=f"{ALARM_TAB_TEXT} ({len(active)})")
+        else:
+            self.alarm_summary.config(text="✔ Brak aktywnych alarmów", fg=GREEN)
+            self.nb.tab(self.tab_alarms, text=ALARM_TAB_TEXT)
+
+    def _build_group_cards(self, parent, groups, row):
+        """Karty z grupami odczytów w dwóch kolumnach (wspólne dla „Odczyty” i „Alarmy”)."""
         parent.grid_columnconfigure(0, weight=1, uniform="col")
         parent.grid_columnconfigure(1, weight=1, uniform="col")
         cols = [tk.Frame(parent, bg=BG), tk.Frame(parent, bg=BG)]
-        cols[0].grid(row=0, column=0, sticky="new", padx=(0, 7), pady=(10, 4))
-        cols[1].grid(row=0, column=1, sticky="new", padx=(7, 0), pady=(10, 4))
-        layout = {"Temperatury i moc": 0, "Paliwo": 0, "Podajnik i kalibracja": 0,
-                  "Czujnik pokojowy BT4": 0, "Info o sterowniku": 0,
-                  "Stan urządzeń": 1, "Ciśnienie i wentylator": 1,
-                  "Serwis wymiennika": 1, "Moduł CQ i energia": 1,
-                  "Alarmy": 1}
-        for gname, items in GROUPS.items():
-            card, body = self._card(cols[layout[gname]], gname)
+        cols[0].grid(row=row, column=0, sticky="new", padx=(0, 7), pady=(10 if row == 0 else 0, 4))
+        cols[1].grid(row=row, column=1, sticky="new", padx=(7, 0), pady=(10 if row == 0 else 0, 4))
+        heights = [0, 0]
+        for gname, keys in groups.items():
+            col = 0 if heights[0] <= heights[1] else 1          # karty układają się równo w dwóch kolumnach
+            heights[col] += len(keys) + 2
+            card, body = self._card(cols[col], gname)
             card.pack(fill="x", pady=(0, 14))
-            for i, (key, name, _) in enumerate(items):
-                row = tk.Frame(body, bg=CARD)
-                row.pack(fill="x")
-                tk.Label(row, text=name, font=FONT_LABEL, bg=CARD, fg=LABEL_FG, anchor="w"
-                         ).pack(side="left", pady=6)
-                lbl = tk.Label(row, text="—", font=FONT_VALUE, bg=CARD, fg=FG, anchor="e")
+            for i, key in enumerate(keys):
+                line = tk.Frame(body, bg=CARD)
+                line.pack(fill="x")
+                name = tk.Label(line, text=describe(key), font=FONT_LABEL, bg=CARD, fg=LABEL_FG, anchor="w")
+                name.pack(side="left", pady=6)
+                lbl = tk.Label(line, text="—", font=FONT_VALUE, bg=CARD, fg=FG, anchor="e")
                 lbl.pack(side="right", padx=(12, 0))
                 self.value_labels[key] = lbl
-                if i < len(items) - 1:
+                self.name_labels[key] = name
+                if i < len(keys) - 1:
                     tk.Frame(body, bg=ROWSEP, height=1).pack(fill="x")
+
+    # ------------------------------------------------------------- zakładka „Parametry” (wszystkie wartości)
+    def _build_params(self, parent):
+        card, body = self._card(parent, "Wszystkie parametry sterownika")
+        card.pack(fill="both", expand=True, pady=(10, 6))
+        top = tk.Frame(body, bg=CARD)
+        top.pack(fill="x", pady=(0, 8))
+        ttk.Label(top, text="Szukaj:", style="Card.TLabel").pack(side="left")
+        self.param_search = tk.StringVar()
+        ttk.Entry(top, textvariable=self.param_search, width=22, font=(FONT_FAMILY, 11)
+                  ).pack(side="left", padx=(6, 14))
+        self.param_search.trace_add("write", lambda *a: self._params_refresh(force=True))
+        ttk.Label(top, text="Grupa:", style="Card.TLabel").pack(side="left")
+        self.param_group = tk.StringVar(value="Wszystkie")
+        self.cb_group = ttk.Combobox(top, textvariable=self.param_group, values=["Wszystkie"],
+                                     state="readonly", width=24, font=(FONT_FAMILY, 10))
+        self.cb_group.pack(side="left", padx=6)
+        self.cb_group.bind("<<ComboboxSelected>>", lambda e: self._params_refresh(force=True))
+        ttk.Button(top, text="Zapisz zrzut do CSV", style="Soft.TButton", command=self.export_params
+                   ).pack(side="right")
+        ttk.Button(top, text="Zmień opis…", style="Soft.TButton", command=self._describe_selected
+                   ).pack(side="right", padx=(0, 8))
+        ttk.Button(top, text="Zmień wartość…", style="Soft.TButton", command=self._edit_selected
+                   ).pack(side="right", padx=(0, 8))
+        self.param_count = tk.StringVar(value="")
+        ttk.Label(top, textvariable=self.param_count, style="Muted.TLabel").pack(side="right", padx=12)
+        self.edit_lbl = tk.Label(top, textvariable=self.edit_state, font=(FONT_FAMILY, 10, "bold"), bg=CARD)
+        self.edit_lbl.pack(side="right", padx=12)
+
+        wrap = tk.Frame(body, bg=CARD)
+        wrap.pack(fill="both", expand=True)
+        self.ptree = ttk.Treeview(wrap, columns=("grupa", "opis", "klucz", "wartosc", "ryzyko"), show="headings",
+                                  selectmode="browse", style="Params.Treeview")
+        for col, title, width, anchor in (("grupa", "Grupa", 160, "w"), ("opis", "Opis", 270, "w"),
+                                          ("klucz", "Parametr", 180, "w"), ("wartosc", "Wartość", 140, "e"),
+                                          ("ryzyko", "Ryzyko", 115, "w")):
+            self.ptree.heading(col, text=title, anchor="w")
+            self.ptree.column(col, width=self.px(width), anchor=anchor)
+        vsb = ttk.Scrollbar(wrap, orient="vertical", command=self.ptree.yview)
+        self.ptree.configure(yscrollcommand=vsb.set)
+        self.ptree.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+        self.ptree.tag_configure("red", foreground=RED)                 # alarm / stan krytyczny (odczyty)
+        for risk, (_, _, color) in E.RISK_INFO.items():                 # kolory ryzyka edytowalnych parametrów
+            self.ptree.tag_configure("risk_" + risk, foreground=color)
+        self.ptree.bind("<Double-1>", self._on_param_dblclick)
+        self.ptree.bind("<Return>", lambda e: self._edit_selected())
+        self.ptree.bind("<Button-3>", self._on_param_menu)
+        self.pmenu = tk.Menu(self, tearoff=0)
+        self.pmenu.add_command(label="Zmień wartość…", command=self._edit_selected)
+        self.pmenu.add_command(label="Zmień opis…", command=self._describe_selected)
+        self.ptip = TreeTip(self.ptree, self._param_tip)               # podpowiedź: dlaczego wiersz jest zablokowany
+        ttk.Label(body, style="Muted.TLabel", wraplength=self.px(900), justify="left",
+                  text="Dwuklik w dowolnym miejscu wiersza (albo Enter na zaznaczonym) = zmiana wartości "
+                       "parametru, tylko po odblokowaniu edycji w Ustawieniach. Kolory: zielony – nastawy "
+                       "temperatur, żółty – histerezy, czasy i korekty czujników, czerwony – czyszczenie i "
+                       "ustawienia urządzenia (dodatkowe potwierdzenie). „🔒 zablokowane” = sieć, czas, "
+                       "tożsamość, serwis, spalanie, korekty czujników kotła/powrotu/spalin/podajnika i parametry "
+                       "bez opisu – najedź myszką, aby zobaczyć powód. „—” = odczyt. Opis parametru zmienisz "
+                       "przyciskiem „Zmień opis…” albo prawym przyciskiem myszy (zapisywany na stałe; puste pole "
+                       "przywraca opis domyślny)."
+                  ).pack(anchor="w", pady=(6, 0))
+        self.editor = ParamEditor(
+            self, parent, self._card, self.px,
+            get_client=lambda: self.client if self.running else None,
+            get_data=lambda: self.param_data if self.running else None,
+            get_host=lambda: self.host_var.get(), is_unlocked=self.edit_var.get, post=self._post,
+            set_status=self.status.set, on_data=self._edit_apply, program=f"{APP_TITLE} {APP_VERSION}")
+        self._update_edit_state()
+
+    def _on_param_dblclick(self, event):
+        """Dwuklik w dowolnym miejscu wiersza (każda kolumna) otwiera okno zmiany wartości."""
+        if self.ptree.identify_region(event.x, event.y) != "cell":
+            return
+        key = self.ptree.identify_row(event.y)
+        if key:
+            self.ptree.selection_set(key)
+            self.editor.edit_value(key)
+
+    def _on_param_menu(self, event):
+        key = self.ptree.identify_row(event.y)
+        if not key:
+            return
+        self.ptree.selection_set(key)
+        try:
+            self.pmenu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.pmenu.grab_release()
+
+    def _selected_param(self):
+        sel = self.ptree.selection()
+        if not sel:
+            messagebox.showinfo(APP_TITLE, "Zaznacz najpierw parametr na liście.")
+            return None
+        return sel[0]
+
+    def _edit_selected(self):
+        key = self._selected_param()
+        if key:
+            self.editor.edit_value(key)
+
+    def _describe_selected(self):
+        key = self._selected_param()
+        if key:
+            self._edit_description(key)
+
+    @staticmethod
+    def _param_tip(key):
+        """Podpowiedź przy wierszu: powód blokady (puste dla parametrów, które można edytować)."""
+        return E.why_not_editable(key)
+
+    def _edit_apply(self, data):
+        """Po zapisie parametru: odśwież widoki świeżymi danymi (tylko gdy nadal połączony)."""
+        if not data or not self.running:
+            return
+        self.param_data = data
+        self._apply_only(data)
+        self._sync_controls(data)
+        self._params_refresh()
+
+    def _on_edit_toggle(self):
+        if self.edit_var.get() and not messagebox.askyesno(
+                APP_TITLE, "Odblokować edycję parametrów sterownika?\n\nZmiana parametrów może rozregulować "
+                           "ogrzewanie albo uszkodzić instalację. Robisz to na własną odpowiedzialność.\n\n"
+                           "Przed każdą zmianą program zrobi automatyczną kopię, a zmiany trafią do dziennika.",
+                icon="warning", default="no"):
+            self.edit_var.set(False)
+        self._update_edit_state()
+
+    def _update_edit_state(self):
+        on = self.edit_var.get()
+        self.edit_state.set("Edycja: WŁĄCZONA" if on else "Edycja: wyłączona (tylko odczyt)")
+        self.edit_lbl.config(fg=RED if on else MUTED)
+
+    def _p_text(self, key, raw):
+        return with_unit(key, format_value(key, raw))
+
+    def _p_tags(self, key, raw):
+        risk = E.risk_of(key)                                    # edytowalny parametr -> kolor ryzyka
+        if risk:
+            return ("risk_" + risk,)
+        return ("red",) if value_color(key, raw, safe_int(self.fuel_thr_var, 20)) == RED else ()
+
+    def _params_refresh(self, force=False):
+        """Odświeża tabelę parametrów (tylko gdy zakładka jest widoczna)."""
+        if not self.param_data or self.nb.select() != str(self.tab_params):
+            return
+        keys_now = list(self.param_data)
+        if force or keys_now != self._p_keys:
+            self._p_keys = keys_now
+            self._params_rebuild()
+        else:
+            for k in self._p_shown:
+                raw = self.param_data.get(k)
+                txt = self._p_text(k, raw)
+                if self._p_vals.get(k) != txt:
+                    self._p_vals[k] = txt
+                    self.ptree.set(k, "wartosc", txt)
+                    self.ptree.item(k, tags=self._p_tags(k, raw))
+
+    def _params_rebuild(self):
+        data = self.param_data
+        order = {g: i for i, g in enumerate(GROUP_ORDER)}
+        groups = sorted({group_of(k) for k in data}, key=lambda g: order.get(g, 99))
+        self.cb_group.config(values=["Wszystkie"] + groups)
+        grp = self.param_group.get()
+        if grp != "Wszystkie" and grp not in groups:
+            self.param_group.set("Wszystkie")
+            grp = "Wszystkie"
+        query = self.param_search.get().strip().lower()
+        idx = {k: i for i, k in enumerate(data)}
+        keys = sorted(data, key=lambda k: (order.get(group_of(k), 99), idx[k]))
+        self.ptree.delete(*self.ptree.get_children())
+        self._p_shown, self._p_vals = [], {}
+        for k in keys:
+            if grp != "Wszystkie" and group_of(k) != grp:
+                continue
+            txt = self._p_text(k, data[k])
+            desc = describe(k) if has_description(k) else "—"
+            if query and query not in f"{desc} {k} {txt}".lower():
+                continue
+            self.ptree.insert("", "end", iid=k, values=(group_of(k), desc, k, txt, E.risk_text(k)),
+                             tags=self._p_tags(k, data[k]))
+            self._p_shown.append(k)
+            self._p_vals[k] = txt
+        self.param_count.set(f"{len(self._p_shown)} z {len(data)} parametrów")
+
+    def _edit_description(self, key):
+        current = describe(key) if has_description(key) else ""
+        new = simpledialog.askstring(
+            "Opis parametru", f"Parametr:  {key}\nWartość:  {self._p_vals.get(key, '')}\n\n"
+                              "Nowy opis (puste = opis domyślny):", initialvalue=current, parent=self)
+        if new is None:
+            return
+        set_override(key, new)
+        if key in self.name_labels:
+            self.name_labels[key].config(text=describe(key))
+        self._params_refresh(force=True)
+        self.status.set(f"Zapisano opis parametru {key}")
+
+    def export_params(self):
+        if not self.param_data:
+            messagebox.showinfo(APP_TITLE, "Najpierw połącz się ze sterownikiem.")
+            return
+        try:
+            path = export_snapshot(self.param_data, describe)
+            self.status.set(f"Zapisano zrzut parametrów: {path}")
+            messagebox.showinfo(APP_TITLE, f"Zapisano wszystkie parametry do pliku:\n{path}")
+        except Exception as e:
+            messagebox.showerror(APP_TITLE, f"Nie udało się zapisać: {e}")
 
     def _build_controls(self, parent):
         card, body = self._card(parent, "Nastawy pieca")
@@ -336,6 +634,7 @@ class App(tk.Tk):
     def _on_tab_changed(self, event=None):
         self.after(50, self.draw_chart)
         self.after(60, self.schema.redraw)
+        self.after(70, lambda: self._params_refresh(force=True))
 
     def _wrap_label(self, parent, text, **kw):
         """Etykieta z zawijaniem tekstu dopasowanym do szerokości karty."""
@@ -368,7 +667,7 @@ class App(tk.Tk):
                  padx=9, pady=1).pack(side="left", padx=(12, 0), pady=(4, 0))
         tk.Label(txt, text=f"Wersja {APP_VERSION}   ·   {COPYRIGHT}", font=(FONT_FAMILY, 10),
                  bg=CARD, fg=MUTED).pack(anchor="w")
-        self._wrap_label(body, "Program do odczytu i sterowania palnikiem Pello 3.5 (sterownik esterownik.pl) "
+        self._wrap_label(body, "Program do odczytu i sterowania sterownikiem Pello 3.5 / Pello D (esterownik.pl) "
                                "z poziomu komputera z Windows. Możliwości:").pack(fill="x", pady=(4, 4))
         for f in FEATURES:
             self._wrap_label(body, "•  " + f).pack(fill="x", padx=(10, 0), pady=1)
@@ -427,10 +726,12 @@ class App(tk.Tk):
         ttk.Label(body, text="Odświeżanie (sekundy)", style="Card.TLabel").grid(row=3, column=0, padx=(0, 16), **pad)
         ttk.Spinbox(body, from_=5, to=3600, textvariable=self.int_var, width=8, font=(FONT_FAMILY, 11)
                     ).grid(row=3, column=1, **pad)
-        ttk.Checkbutton(body, text="Zapamiętaj hasło", variable=self.save_pass, style="Card.TCheckbutton"
-                        ).grid(row=4, column=0, columnspan=2, **pad)
+        ttk.Checkbutton(body, text="Zapamiętaj hasło (zapis zaszyfrowany)", variable=self.save_pass,
+                        style="Card.TCheckbutton").grid(row=4, column=0, columnspan=2, **pad)
+        ttk.Label(body, textvariable=self.pw_note, style="Muted.TLabel", wraplength=self.px(520), justify="left"
+                  ).grid(row=5, column=0, columnspan=2, sticky="w", padx=(24, 0))
         ttk.Checkbutton(body, text="Łącz automatycznie po uruchomieniu programu", variable=self.auto_var,
-                        style="Card.TCheckbutton").grid(row=5, column=0, columnspan=2, **pad)
+                        style="Card.TCheckbutton").grid(row=6, column=0, columnspan=2, **pad)
 
         # --- historia CSV
         card, body = self._card(parent, "Historia pracy (CSV)")
@@ -440,6 +741,22 @@ class App(tk.Tk):
         ttk.Label(body, text=f"Folder: {CSV_DIR}", style="Muted.TLabel").pack(anchor="w")
         ttk.Button(body, text="Otwórz folder z historią", style="Soft.TButton", command=self.open_csv_dir
                    ).pack(anchor="w", pady=(8, 2))
+
+        # --- edycja parametrów
+        card, body = self._card(parent, "Edycja parametrów (zaawansowane)")
+        card.pack(fill="x", pady=(0, 12))
+        ttk.Checkbutton(body, text="Odblokuj edycję pojedynczych parametrów w zakładce Parametry",
+                        variable=self.edit_var, style="Card.TCheckbutton", command=self._on_edit_toggle
+                        ).pack(anchor="w", pady=4)
+        ttk.Label(body, style="Muted.TLabel", wraplength=self.px(560), justify="left",
+                  text="Domyślnie program działa tylko do odczytu. Po odblokowaniu dwuklik na wierszu "
+                       "parametru pozwala zmienić jego wartość: program pokazuje „stara → nowa wartość”, przy "
+                       "parametrach czerwonych prosi o dodatkowe potwierdzenie, robi automatyczną kopię "
+                       "ustawień, sprawdza zapis odczytem i zapisuje zmianę w dzienniku (z przyciskiem „Cofnij”). "
+                       "Sieć, czas, tożsamość, serwis, spalanie, korekty czujników kotła, powrotu, spalin i "
+                       "podajnika oraz parametry bez opisu są zablokowane na stałe i nie da się ich odblokować. "
+                       "Po każdym uruchomieniu programu edycja jest znów zablokowana."
+                  ).pack(anchor="w", pady=(0, 6))
 
         # --- powiadomienia i zasobnik
         card, body = self._card(parent, "Powiadomienia i zasobnik")
@@ -469,8 +786,11 @@ class App(tk.Tk):
             return
         self.host_var.set(cfg.get("host", ""))
         self.user_var.set(cfg.get("user", "root"))
-        self.pass_var.set(cfg.get("password", ""))
-        self.save_pass.set(bool(cfg.get("password")))
+        password, method = pello_secret.load(cfg, self.host_var.get(), self.user_var.get())
+        self.pass_var.set(password)
+        self.save_pass.set(method != "none")
+        self.pw_note.set(pello_secret.METHOD_TEXT.get(method, ""))
+        legacy = bool(cfg.get("password")) and "pw_store" not in cfg      # stary plik: hasło jawnym tekstem
         self.int_var.set(cfg.get("interval", 30))
         self.csv_var.set(cfg.get("csv", True))
         self.notify_var.set(cfg.get("notify", True))
@@ -478,6 +798,8 @@ class App(tk.Tk):
         self.tray_close_var.set(cfg.get("close_to_tray", True))
         self.auto_var.set(cfg.get("auto_connect", False))
         self.range_var.set(cfg.get("range", "6 godzin"))
+        if legacy and password:
+            self._save_config()          # migracja: przenieś hasło do bezpieczniejszej metody
 
     def _save_config(self):
         cfg = {
@@ -491,8 +813,14 @@ class App(tk.Tk):
             "auto_connect": self.auto_var.get(),
             "range": self.range_var.get(),
         }
-        if self.save_pass.get():
-            cfg["password"] = self.pass_var.get()
+        host, user = self.host_var.get(), self.user_var.get()
+        if self.save_pass.get() and self.pass_var.get():
+            stored = pello_secret.store(host, user, self.pass_var.get())
+            cfg.update(stored)
+            self.pw_note.set(pello_secret.METHOD_TEXT.get(stored["pw_store"], ""))
+        else:
+            pello_secret.forget(host, user)
+            self.pw_note.set("")
         try:
             CONFIG_FILE.write_text(json.dumps(cfg), encoding="utf-8")
         except Exception:
@@ -534,6 +862,7 @@ class App(tk.Tk):
 
     def quit_app(self):
         self._save_config()
+        self._closing = True
         self.running = False
         self.gen += 1
         self.tray.stop()
@@ -550,6 +879,7 @@ class App(tk.Tk):
             self.status.set("Rozłączony")
             self._set_conn("off", "Rozłączony")
             self.schema.update(None)
+            self._update_alarm_summary(None)
             self._set_tray("off", "Pello: rozłączony")
             return
         if not self.host_var.get().strip():
@@ -559,6 +889,7 @@ class App(tk.Tk):
         self.client = PelloClient(self.host_var.get(), self.user_var.get(), self.pass_var.get())
         self._save_config()
         self.running = True
+        self._orig_checked = False
         self.gen += 1
         self.fail_count = 0
         self.btn.config(text="Rozłącz", style="Dark.TButton")
@@ -574,9 +905,9 @@ class App(tk.Tk):
     def _fetch(self, gen):
         try:
             data = self.client.read_all()
-            self.after(0, self._update, gen, data, None)
+            self._post(self._update, gen, data, None)
         except Exception as e:
-            self.after(0, self._update, gen, None, e)
+            self._post(self._update, gen, None, e)
 
     def _update(self, gen, data, err):
         if not self.running or gen != self.gen:
@@ -605,12 +936,14 @@ class App(tk.Tk):
             self.notify("Pello: połączenie przywrócone", "Sterownik znowu odpowiada.")
 
         self._set_conn("ok", "Połączono")
-
-        # info o sterowniku w nagłówku (device_name | IP | wersja softu)
-        name, ip, soft = data.get("device_name", ""), data.get("eth_ip", ""), data.get("device_soft_version", "")
-        if name or ip:
-            self.dev_var.set(f"{name}  ·  {ip}" + (f"  ·  soft {soft}" if soft else ""))
-
+        self.param_data = data
+        if not self._orig_checked:                    # pierwszy odczyt po połączeniu -> kopia pierwotna (raz)
+            self._orig_checked = True
+            self.backups.ensure_original(data)
+        if data.get("device_name") or data.get("device_type"):
+            self.dev_var.set(" · ".join(x for x in (data.get("device_name"), data.get("device_type"),
+                                                    "v" + data["device_soft_version"]
+                                                    if data.get("device_soft_version") else "") if x))
         self._apply_only(data)
         self.schema.update(data, safe_int(self.fuel_thr_var, 20))
         self._sync_controls(data)
@@ -619,12 +952,13 @@ class App(tk.Tk):
         self._check_notifications(data)
 
         tip = (f"Pello: kocioł {format_value('tkot_value', data.get('tkot_value'))} °C | "
-               f"CO 2 {format_value('tcwu_value', data.get('tcwu_value'))} °C | "
+               f"CWU {format_value('tcwu_value', data.get('tcwu_value'))} °C | "
                f"{format_value('pl_status', data.get('pl_status'))}")
         if self.alarm_active:
             tip += " | ALARM!"
         self._set_tray("alarm" if self.alarm_active else "ok", tip)
         self.draw_chart()
+        self._params_refresh()
 
         msg = f"Ostatni odczyt: {now:%H:%M:%S}"
         if self.csv_error:
@@ -633,12 +967,11 @@ class App(tk.Tk):
 
     def _apply_only(self, data):
         thr = safe_int(self.fuel_thr_var, 20)
-        for key, unit in self.units.items():
+        for key, lbl in self.value_labels.items():
             if key in data:
-                txt = format_value(key, data[key])
-                if unit and txt != "—":
-                    txt += f" {unit}"
-                self.value_labels[key].config(text=txt, fg=value_color(key, data[key], thr))
+                txt = with_unit(key, format_value(key, data[key]))
+                lbl.config(text=txt, fg=value_color(key, data[key], thr))
+        self._update_alarm_summary(data)
 
     def _sync_controls(self, data):
         try:
@@ -659,12 +992,12 @@ class App(tk.Tk):
     # ------------------------------------------------------------- powiadomienia o zdarzeniach
     def _check_notifications(self, data):
         active = []
-        for key, name, _ in GROUPS["Alarmy"]:
+        for key in ALARM_KEYS:
             v = str(data.get(key, "0"))
             if v == "1":
-                active.append(name)
+                active.append(key)
                 if self.prev_alarms.get(key, "0") != "1":
-                    self.notify("⚠ ALARM pieca Pello", name)
+                    self.notify("⚠ ALARM pieca Pello", describe(key))
             self.prev_alarms[key] = v
         self.alarm_active = bool(active)
 
@@ -782,21 +1115,46 @@ class App(tk.Tk):
         if not self.client:
             messagebox.showwarning(APP_TITLE, "Najpierw połącz się ze sterownikiem.")
             return
+        self.status.set(f"Wysyłam do sterownika: {label}…")
+        client = self.client
 
         def work():
             try:
-                self.client.set_register(key, value)
-                self.after(0, lambda: self.status.set(f"Ustawiono {label}"))
-                self.after(500, lambda: threading.Thread(target=self._fetch_once, daemon=True).start())
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror(APP_TITLE, f"Nie udało się ustawić: {e}"))
+                ok, actual, data = client.set_and_verify(key, value)
+            except PelloWriteError as e:            # sterownik odmówił (np. access_denied)
+                msg = str(e)
+                self._post(self._write_failed, label, msg)
+                return
+            except Exception as e:                  # błąd sieci itp.
+                msg = str(e)
+                self._post(self._write_failed, label, f"Nie udało się wysłać nastawy: {msg}")
+                return
+            self._post(self._write_done, key, value, label, ok, actual, data)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _write_failed(self, label, message):
+        self.status.set(f"NIE ustawiono: {label}")
+        messagebox.showerror(APP_TITLE, message)
+
+    def _write_done(self, key, value, label, ok, actual, data):
+        if data and self.running:           # po rozłączeniu nie odświeżamy widoków
+            self._apply_only(data)
+        if ok:
+            self.status.set(f"Ustawiono {label} – potwierdzone przez sterownik")
+            return
+        self._sync_controls(data or {})             # pola nastaw wracają do wartości ze sterownika
+        self.status.set(f"Sterownik nie potwierdził zmiany: {label}")
+        messagebox.showwarning(
+            APP_TITLE,
+            f"Sterownik nie zmienił wartości „{key}”.\n\nOczekiwano: {value}\nOdczytano: {actual}\n\n"
+            "Możliwe przyczyny: brak uprawnień do zapisu (sprawdź login i hasło w Ustawieniach), "
+            "wartość poza dozwolonym zakresem albo sterownik jeszcze jej nie zastosował.")
 
     def _fetch_once(self):
         try:
             data = self.client.read_all()
-            self.after(0, self._apply_only, data)
+            self._post(self._apply_only, data)
         except Exception:
             pass
 
